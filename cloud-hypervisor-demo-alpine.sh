@@ -66,11 +66,10 @@ MINIROOTFS="alpine-minirootfs-${ALPINE_VERSION}-${ARCH}.tar.gz"
 MINIROOTFS_URL="$ALPINE_BASE/$MINIROOTFS"
 MINIROOTFS_SHA_URL="$MINIROOTFS_URL.sha256"
 
-KERNEL_URL="$ALPINE_BASE/netboot/vmlinuz-virt"
-INITRD_URL="$ALPINE_BASE/netboot/initramfs-virt"
-
-KERNEL="$VM_DIR/vmlinuz-virt"
-INITRD="$VM_DIR/initramfs-virt"
+CH_KERNEL_BRANCH="ch-6.16.9"
+CH_KERNEL_REPO="https://github.com/cloud-hypervisor/linux.git"
+KERNEL_SRC="$VM_DIR/linux-cloud-hypervisor"
+KERNEL="$VM_DIR/vmlinux"
 
 DISK="$VM_DIR/alpine-100m.raw"
 ROOTFS_MOUNT="$VM_DIR/rootfs"
@@ -84,7 +83,7 @@ ROOTFS_MOUNT="$VM_DIR/rootfs"
 echo "==> Cloud Hypervisor"
 "$CH" --version
 
-for cmd in curl tar sha256sum; do
+for cmd in curl tar sha256sum git make gcc bc bison flex perl; do
     command -v "$cmd" >/dev/null 2>&1 \
         || error "Required command not found: $cmd"
 done
@@ -147,28 +146,6 @@ curl -fL \
     cd "$VM_DIR"
     sha256sum -c "$(basename "$MINIROOTFS_SHA")"
 )
-
-# ------------------------------------------------------------
-# Download kernel
-# ------------------------------------------------------------
-
-echo
-echo "==> Downloading Alpine kernel"
-
-if [[ ! -s "$KERNEL" ]]; then
-    curl -fL \
-        --retry 5 \
-        --retry-delay 2 \
-        --retry-all-errors \
-        --progress-bar \
-        -o "$KERNEL.tmp" \
-        "$KERNEL_URL"
-
-    [[ -s "$KERNEL.tmp" ]] \
-        || error "Kernel download failed."
-
-    mv "$KERNEL.tmp" "$KERNEL"
-fi
 
 # ------------------------------------------------------------
 # Create 100 MiB disk
@@ -289,17 +266,15 @@ chmod +x "$ROOTFS_MOUNT/bin/busybox"
 
 # Configure inittab for remount, network, and shell
 tee "$ROOTFS_MOUNT/etc/inittab" >/dev/null <<'EOF'
-::sysinit:/bin/mount -o remount,rw /
 ::sysinit:/bin/mount -t proc proc /proc 2>/dev/null || true
 ::sysinit:/bin/mount -t sysfs sysfs /sys 2>/dev/null || true
 ::sysinit:/bin/mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 ::sysinit:/bin/mount -t tmpfs tmpfs /run 2>/dev/null || true
+::sysinit:/bin/mount -o remount,rw /
 ::sysinit:/bin/hostname -F /etc/hostname 2>/dev/null || hostname alpine-ch
-
 ::sysinit:/sbin/ip link set eth0 up
 ::sysinit:/sbin/ip addr add 192.168.100.2/24 dev eth0
 ::sysinit:/sbin/ip route add default via 192.168.100.1
-
 ttyS0::respawn:-/bin/sh
 tty1::respawn:-/bin/sh
 EOF
@@ -315,75 +290,59 @@ umount "$ROOTFS_MOUNT"
 MOUNTED=0
 
 # ------------------------------------------------------------
-# Build ext4-capable kernel + initramfs outside the 100 MiB VM disk
+# Build Cloud Hypervisor Linux kernel
 # ------------------------------------------------------------
-
 echo
-echo "==> Building Alpine kernel and initramfs"
+echo "==> Building Cloud Hypervisor Linux kernel"
 
-BUILD_ROOT="$VM_DIR/alpine-initramfs-build"
+if [[ ! -d "$KERNEL_SRC/.git" ]]; then
+    echo "    Cloning Cloud Hypervisor Linux: $CH_KERNEL_BRANCH"
 
-rm -rf "$BUILD_ROOT"
-mkdir -p "$BUILD_ROOT"
-
-echo "    Extracting Alpine minirootfs into build environment"
-tar -xzf "$MINIROOTFS_FILE" -C "$BUILD_ROOT"
-
-tee "$BUILD_ROOT/etc/apk/repositories" >/dev/null <<EOF
-https://dl-cdn.alpinelinux.org/alpine/v3.24/main
-https://dl-cdn.alpinelinux.org/alpine/v3.24/community
-EOF
-
-cp -L /etc/resolv.conf "$BUILD_ROOT/etc/resolv.conf"
-
-chroot "$BUILD_ROOT" /bin/sh -c \
-    'getent hosts dl-cdn.alpinelinux.org >/dev/null 2>&1' \
-    || error "DNS resolution failed inside Alpine build chroot."
-
-chroot "$BUILD_ROOT" /sbin/apk update
-chroot "$BUILD_ROOT" /sbin/apk add --no-cache linux-virt mkinitfs
-
-KERNEL_VERSION="$(chroot "$BUILD_ROOT" /bin/sh -c \
-    'for f in /lib/modules/*/kernel-suffix; do
-        [ -f "$f" ] || continue
-        d="${f%/kernel-suffix}"
-        basename "$d"
-        break
-    done')"
-
-[[ -n "$KERNEL_VERSION" ]] \
-    || error "Could not determine installed Alpine kernel version."
-
-echo "    Kernel version: $KERNEL_VERSION"
-
-tee "$BUILD_ROOT/etc/mkinitfs/mkinitfs.conf" >/dev/null <<'EOF'
-features="base virtio ext4 kms"
-EOF
-
-chroot "$BUILD_ROOT" \
-    /sbin/mkinitfs \
-    -c /etc/mkinitfs/mkinitfs.conf \
-    -o /tmp/initramfs-virt-ext4 \
-    "$KERNEL_VERSION"
-
-cp "$BUILD_ROOT/boot/vmlinuz-virt" "$KERNEL"
-cp "$BUILD_ROOT/tmp/initramfs-virt-ext4" "$INITRD"
-
-[[ -s "$KERNEL" ]] || error "Generated Alpine kernel is empty."
-[[ -s "$INITRD" ]] || error "Generated Alpine initramfs is empty."
-
-if command -v lsinitramfs >/dev/null 2>&1; then
-    lsinitramfs "$INITRD" | grep -qE '(^|/)ext4\.ko' \
-        || error "Generated initramfs does not contain ext4.ko."
+    git clone \
+        --depth 1 \
+        --branch "$CH_KERNEL_BRANCH" \
+        "$CH_KERNEL_REPO" \
+        "$KERNEL_SRC"
+else
+    echo "    Cloud Hypervisor Linux source already exists."
 fi
 
+(
+    cd "$KERNEL_SRC"
+
+    echo "    Configuring kernel"
+    make ch_defconfig
+
+    echo "    Checking required VM features"
+
+    grep -q '^CONFIG_VIRTIO_PCI=y' .config \
+        || error "Cloud Hypervisor kernel lacks CONFIG_VIRTIO_PCI=y"
+
+    grep -q '^CONFIG_VIRTIO_BLK=y' .config \
+        || error "Cloud Hypervisor kernel lacks CONFIG_VIRTIO_BLK=y"
+
+    grep -q '^CONFIG_VIRTIO_NET=y' .config \
+        || error "Cloud Hypervisor kernel lacks CONFIG_VIRTIO_NET=y"
+
+    grep -q '^CONFIG_EXT4_FS=y' .config \
+        || error "Cloud Hypervisor kernel lacks CONFIG_EXT4_FS=y"
+
+    echo "    Building x86-64 kernel"
+
+    make -j"$(nproc)" bzImage
+)
+
+KERNEL_BUILD="$KERNEL_SRC/arch/x86/boot/compressed/vmlinux.bin"
+
+[[ -s "$KERNEL_BUILD" ]] \
+    || error "Cloud Hypervisor kernel build failed."
+
+cp "$KERNEL_BUILD" "$KERNEL"
+
 echo "    Kernel: $(du -h "$KERNEL" | awk '{print $1}')"
-echo "    Initramfs: $(du -h "$INITRD" | awk '{print $1}')"
 
-rm -rf "$BUILD_ROOT"
-
-chown "$TARGET_USER:$TARGET_GROUP" "$KERNEL" "$INITRD"
-chmod 600 "$KERNEL" "$INITRD"
+chown "$TARGET_USER:$TARGET_GROUP" "$KERNEL"
+chmod 600 "$KERNEL"
 
 # ------------------------------------------------------------
 # KVM
@@ -474,12 +433,12 @@ rm -f "$CH_SOCK"
 
 run_as_target "$CH" \
     --kernel "$KERNEL" \
-    --initramfs "$INITRD" \
-    --disk "path=$DISK" \
-    --net "tap=tap0,ip=192.168.100.1,mask=255.255.255.0" \
+    --disk "path=$DISK,image_type=raw" \
+    --net "tap=tap0" \
     --cpus "boot=1,max=4" \
     --api-socket "$CH_SOCK" \
     --memory "size=256M,hotplug_method=acpi,hotplug_size=2G" \
     --serial tty \
     --console off \
-    --cmdline "console=ttyS0,115200 modules=virtio_pci,virtio_blk,ext4 root=LABEL=alpine-root rootfstype=ext4 rw init=/sbin/init"
+    --cmdline "console=ttyS0,115200 root=/dev/vda rootfstype=ext4 rw init=/sbin/init"
+ 

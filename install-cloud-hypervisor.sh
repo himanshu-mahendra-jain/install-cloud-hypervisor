@@ -150,9 +150,20 @@ REQUIRED_PACKAGES=(
     coreutils
     curl
     file
+    git
     grep
     nftables
     tar
+    bc
+    bison
+    flex
+    gcc
+    make
+    perl
+    pkgconf
+    openssl-dev
+    elfutils-dev
+    dwarves
 )
 
 if command -v apt-get >/dev/null 2>&1; then
